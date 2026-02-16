@@ -4,7 +4,7 @@
 # Julia implementation by Marc A. Tunnell (https://tunnellm.github.io/)
 
 """
-    M, approx_work = ssai3(A; fill_factor=1.0)
+    ssai3(A; fill_factor=1.0) -> NamedTuple
 
 Constructs a SPAI-type preconditioner M ≈ A⁻¹ for symmetric positive definite A.
 
@@ -17,15 +17,19 @@ Reference: https://stanford.edu/group/SOL/reports/20SSAI.pdf
                  (lfil = ceil(fill_factor * avg_nnz_per_col), default: 1.0)
 
 # Returns
+NamedTuple with fields:
 - `M`: Symmetric approximate inverse preconditioner
-- `approx_work`: Approximate flop count
+- `flops`: Total floating-point operations (FMAs, divisions)
+- `graph_ops`: Total graph operations (sorting)
+- `solve_flops`: Flops per preconditioner application (= nnz(M), one SpMV)
 
 # Example
 ```julia
 using FastSSAI3, SparseArrays, LinearAlgebra
 A = sprand(1000, 1000, 0.01) + 10I
 A = (A + A') / 2  # symmetrize
-M, work = ssai3(A; fill_factor=2.0)
+result = ssai3(A; fill_factor=2.0)
+M = result.M
 ```
 
 This implementation uses direct CSC building instead of triplet storage.
@@ -59,6 +63,7 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
     remote_count = zeros(Int, nthreads)
 
     approx_work = zeros(Int, nthreads)
+    graph_ops_t = zeros(Int, nthreads)
     nneg_t = zeros(Int, nthreads)
     nzero_t = zeros(Int, nthreads)
 
@@ -106,6 +111,7 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
         rc = 0  # remote count for this thread
 
         local_work = 0
+        local_graph_ops = 0
 
         for j in col_start_tid:col_end_tid
             local_j = j - col_start_tid + 1
@@ -131,6 +137,8 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
                         i = idx
                     end
                 end
+                # Graph ops: linear search over r's nonzeros
+                local_graph_ops += r_nnz
 
                 r[i1] = ri1
 
@@ -154,6 +162,8 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
                         break
                     end
                 end
+                # Graph ops: linear search over m's indices
+                local_graph_ops += m_nnz
                 if found > 0
                     @inbounds m_v[found] += delta
                 else
@@ -196,6 +206,8 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
                 @inbounds for p in 1:m_nnz
                     m_v[p] = -m_v[p]
                 end
+                # Graph ops: sign flips
+                local_graph_ops += m_nnz
             end
             if Mjj == 0
                 nzero_t[tid] += 1
@@ -216,6 +228,7 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
                     lvals[k, local_j] = v
                 else
                     v_half = v * T(0.5)
+                    local_work += 1  # halving multiply
                     # Entry (i, j) - column j is local
                     k += 1
                     lrows[k, local_j] = i
@@ -246,6 +259,8 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
                     col_rows[jj + 1] = key_row
                     col_vals[jj + 1] = key_val
                 end
+                # Graph ops: full sort = k × ceil(log₂(k))
+                local_graph_ops += k * ceil(Int, log2(k))
             end
 
             # Clear r workspace
@@ -256,6 +271,7 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
 
         remote_count[tid] = rc
         approx_work[tid] += local_work
+        graph_ops_t[tid] += local_graph_ops
     end
 
     # Phase 2: Build CSC from local columns + remote entries
@@ -374,6 +390,8 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
             temp_I[pos] = rI[p]
             temp_V[pos] = rV[p]
         end
+        # Graph ops: counting sort is linear
+        graph_ops_t[tid] += rc
 
         # Place sorted entries into final CSC arrays
         @inbounds for j in 1:n
@@ -417,6 +435,15 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
             perm = sortperm(col_rows)
             col_rows[:] = col_rows[perm]
             col_vals[:] = col_vals[perm]
+        end
+    end
+
+    # Graph ops for column sorts: col_len × ceil(log₂(col_len)) per column
+    sort_graph_ops = 0
+    @inbounds for j in 1:n
+        col_len = colptr[j + 1] - colptr[j]
+        if col_len > 1
+            sort_graph_ops += col_len * ceil(Int, log2(col_len))
         end
     end
 
@@ -477,7 +504,8 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
     end
 
     M = SparseMatrixCSC(n, n, new_colptr, new_rowval, new_nzval)
-    total_work = sum(approx_work) + nnz(M)
+    total_flops = sum(approx_work) + nnz(A)  # nnz(A) for Anorms precomputation (lines 84-92)
+    total_graph_ops = sum(graph_ops_t) + sort_graph_ops
 
     nneg = sum(nneg_t)
     nzero = sum(nzero_t)
@@ -488,5 +516,5 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
     @printf(" M symmetrized.  nnz(M) = %d\n", nnz(M))
     @printf(" ssai3: fill_factor=%.2f, lfil=%d, %d cores\n", fill_factor, lfil, nthreads)
 
-    return M, total_work
+    return (M=M, flops=total_flops, graph_ops=total_graph_ops, solve_flops=nnz(M))
 end
