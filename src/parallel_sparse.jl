@@ -46,7 +46,7 @@ function cumsum_parallel!(result::AbstractVector{T}, x::AbstractVector{T}) where
             offset += chunk_sums[t]
         end
 
-        @turbo for i in start_idx:end_idx
+        @inbounds @simd for i in start_idx:end_idx
             result[i] += offset
         end
     end
@@ -93,7 +93,7 @@ function sparse_parallel(I::Vector{Int}, J::Vector{Int}, V::Vector{T},
     colptr = Vector{Int}(undef, n + 1)
     colptr[1] = 1
     cumsum_parallel!(@view(colptr[2:end]), col_counts)
-    @tturbo for j in 2:n+1
+    @inbounds @simd for j in 2:n+1
         colptr[j] += 1  # Shift by 1 for 1-based indexing
     end
     nnz_total = colptr[n + 1] - 1
@@ -207,7 +207,7 @@ function sparse_parallel(I::Vector{Int}, J::Vector{Int}, V::Vector{T},
     new_colptr = Vector{Int}(undef, n + 1)
     new_colptr[1] = 1
     cumsum_parallel!(@view(new_colptr[2:end]), unique_counts)
-    @tturbo for j in 2:n+1
+    @inbounds @simd for j in 2:n+1
         new_colptr[j] += 1  # Shift by 1 for 1-based indexing
     end
     new_nnz = new_colptr[n + 1] - 1

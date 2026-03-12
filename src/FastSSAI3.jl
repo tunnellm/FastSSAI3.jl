@@ -12,7 +12,6 @@ using SparseArrays
 using LinearAlgebra
 using Printf
 using Polyester
-using LoopVectorization
 using VectorizedStatistics
 
 export ssai3

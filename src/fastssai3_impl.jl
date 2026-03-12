@@ -85,7 +85,7 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
         col_start = colptr[j]
         col_end = colptr[j+1] - 1
         s = zero(T)
-        @turbo for p in col_start:col_end
+        @inbounds @simd for p in col_start:col_end
             s += nzval[p]^2
         end
         @inbounds Anorms[j] = s
@@ -148,7 +148,7 @@ function ssai3(A::SparseMatrixCSC{T, Int}; fill_factor::Real=1.0) where T <: Rea
                 col_nnz = ce - cs + 1
 
                 dot_val = zero(T)
-                @turbo for p in cs:ce
+                @inbounds for p in cs:ce
                     dot_val += A.nzval[p] * r[A.rowval[p]]
                 end
                 delta = dot_val / Anorms[i]
